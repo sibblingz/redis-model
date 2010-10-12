@@ -1,3 +1,25 @@
+# Copyright (c) 2009-2010, Sibblingz Inc.
+# 
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+# 
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+# 
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+# THE SOFTWARE.
+
+require 'set'
+
 class RedisModel
 
   class << self 
@@ -6,6 +28,20 @@ class RedisModel
     attr_reader :forcesendable_attribute_names
     attr_reader :callbacks
     attr_reader :associations
+  end
+  
+  attr_accessor :old_attributes
+  
+  # WCH: Lifted straight out of ActiveRecord
+  # Returns true if the +comparison_object+ is the same object, or is of the same type and has the same id.
+  def ==(comparison_object)
+    comparison_object.equal?(self) || (comparison_object.instance_of?(self.class) && comparison_object.id == id)
+  end
+  def eql?(comparison_object)
+    self == (comparison_object)
+  end
+  def <=>(comparison_object)
+    self.id <=> comparison_object.id
   end
   
   def to_boolean(value, nil_value = false)
@@ -19,6 +55,14 @@ class RedisModel
       nil_value 
     else
       !!value
+    end
+  end
+  
+  def self.index_attributes(*args)
+    args.each do |arg|
+      self.class_eval "
+        def self.find_by_#{arg}(name); #{self.name}.all.select {|g| g.#{arg} == name}[0]; end
+      "
     end
   end
   
@@ -44,9 +88,19 @@ class RedisModel
         when :bool then "to_boolean(value)"
         when :datetime then "(value.blank?) ? nil : ( value.to_i == 0 ? Time.parse(value.to_s) : Time.at(value.to_i) )" # TODO: Implement a better datetime string conversion        else "value"
         end
+        
+        match_data = /^(.*)_id$/.match(attribute.to_s)
+        set_function_line_two = match_data.nil? ? "" : "@#{match_data[1]} = nil"
+        
         self.class_eval "
-          def #{attribute}; @#{attribute}; end
-          def #{attribute}=(value); @#{attribute}=#{value_conversion}; end
+          def #{attribute}
+            @#{attribute} 
+          end
+          
+          def #{attribute}=(value) 
+            @#{attribute}= #{value_conversion}
+            #{set_function_line_two}
+          end
         "
       end
     end
@@ -73,8 +127,11 @@ class RedisModel
   end
   
   def initialize(hsh={})
-    hsh.each{ |key, value| self.send "#{key}=", value }
-    self.class.defaults.each{ |key, value| self.send "#{key}=", value if self.send( key ).nil? }
+    update_attributes_without_save( self.class.defaults.stringify_keys.merge(hsh.stringify_keys) )
+    
+    # Let's try and just use update_attributes_without_save everywhere
+    # hsh.each{ |key, value| self.send "#{key}=", value }
+    # self.class.defaults.each{ |key, value| self.send "#{key}=", value if self.send( key ).nil? }
   end
   
   def self.redis_key( id )
@@ -94,6 +151,7 @@ class RedisModel
   end
   
   def add_to_class_set
+    raise "InvalidID" if self.id.to_i == 0
     REDIS.sadd self.class.class_set_redis_key, self.id
   end
   
@@ -101,9 +159,15 @@ class RedisModel
     REDIS.srem self.class.class_set_redis_key, self.id
   end
   
+  def update_attributes_without_save( attributes_hash )
+    persistent_attribute_names = self.class.persistent_attribute_names
+    attributes_hash.each do |key, value|
+      self.send( "#{key}=", value ) if persistent_attribute_names.include? key.to_sym
+    end
+  end
+  
   def update_attributes( attributes_hash )
-    attributes_hash.each{ |key, value| puts "#{key}=#{value}" }
-    attributes_hash.each{ |key, value| self.send "#{key}=", value }
+    update_attributes_without_save( attributes_hash )
     save
   end
   
@@ -111,6 +175,10 @@ class RedisModel
     hsh = {}
     self.class.persistent_attribute_names.each{|attr_name| hsh[attr_name] = self.send attr_name}
     hsh
+  end
+  
+  def old_attribute( attr_name )
+    @old_attributes.nil? ? nil : @old_attributes[ attr_name ]
   end
   
   def save
@@ -133,10 +201,29 @@ class RedisModel
     end
     
     # Save It To Redis
-    self.class.persistent_attribute_names.each{ |attribute| 
+    updated_values = []
+    to_delete = []
+    #self.class.persistent_attribute_names.each{ |attribute| 
+    self.class.persistent_attribute_names.each do |attribute|
       value = self.send(attribute)
-      REDIS.hset(redis_key, attribute, value) unless value.nil?
-    }
+      old_value = old_attribute(attribute)
+      
+      if value != old_value
+        if value.nil?
+          to_delete.push(attribute)
+        else
+          updated_values += [attribute, value]
+        end
+      end
+    end
+    
+    if updated_values.size == 2
+      REDIS.hset(redis_key, updated_values[0], updated_values[1])
+    elsif updated_values.size > 2
+      REDIS.hmset(redis_key, *updated_values)
+    end
+    to_delete.each{ |attr_name| REDIS.hdel(redis_key, attr_name) }
+    self.old_attributes = self.attributes.dup
     
     # After Save
     if callbacks && callbacks[:after_save]
@@ -152,23 +239,56 @@ class RedisModel
   end
   
   class RecordNotFound < Exception
+    def initialize(klass, id)
+      @klass = klass
+      @id = id
+    end
+    
+    def to_s
+      "#{self.class.name}: #{@klass} #{@id}"
+    end
   end
   
-  def self.find( id )
+  def self.find_all_ids( ids )
+    ids.map{|id| self.find(id, false)}.compact
+  end
+  
+  class MissingRedisModelError < Exception
+  end
+  
+  def self.find( id, whiny=true )
     hsh = REDIS.hgetall( redis_key(id) )
-    raise RecordNotFound.new unless hsh.has_key? 'id'
-
-    obj = self.new
-    # weed out any attributes that don't exist on the model, like if an attribute was removed from the class but still exist in the database
-    for attribute, value in hsh
-      if @persistent_attribute_names.include? attribute.to_sym
-        obj.send("#{attribute}=", value)
-      else
-        #Rails.logger.info "Tried to set attribute '#{attribute}' = '#{value}' on #{self.to_s}, but it doesn't have that attribute (perhaps the model definition changed recently?)"
+    if whiny
+      raise RecordNotFound.new(self.name, id) unless hsh.has_key? 'id'
+    else
+      if !hsh.has_key?('id')
+        if defined? NewRelic
+          NewRelic::Agent.notice_error( MissingRedisModelError.new(), :custom_params => {:klass => self.name, :id => id} )
+        end
+        return nil
       end
     end
+
+    obj = self.new( hsh )
+    #     Let's try and just use update_attributes_without_save / new (which calls update_attributes_without_save)
+    #     weed out any attributes that don't exist on the model, like if an attribute was removed from the class but still exist in the database
+    #     for attribute, value in hsh
+    #       if @persistent_attribute_names.include? attribute.to_sym
+    #         obj.send("#{attribute}=", value)
+    #       else
+    #         #Rails.logger.info "Tried to set attribute '#{attribute}' = '#{value}' on #{self.to_s}, but it doesn't have that attribute (perhaps the model definition changed recently?)"
+    #       end
+    #     end
     obj.id = id.to_i
+    obj.old_attributes = obj.attributes.dup
     obj
+  end
+  
+  def modified?
+    attributes.each do |k,v|
+      return true if old_attributes[k] != v
+    end
+    false
   end
   
   def self.find_all( ids, strict=true )
@@ -189,6 +309,15 @@ class RedisModel
   
   def destroy
     raise "not saved yet" if self.id.nil?
+
+    callbacks = self.class.callbacks
+        
+    # Before Destroy
+    if callbacks && callbacks[:before_destroy]
+      methods = callbacks[:before_destroy]
+      methods.each{ |method_name| self.send method_name }
+    end
+
     REDIS.del redis_key
     remove_from_class_set
     destroy_dependents
@@ -205,17 +334,23 @@ class RedisModel
         parent.send(removal_method, self)
       end
     end
+    
+    # After Destroy
+    if callbacks && callbacks[:after_destroy]
+      methods = callbacks[:after_destroy]
+      methods.each{ |method_name| self.send method_name }
+    end
   end
   
   def self.destroy( ids )
-    ids.each{ |id| self.find(id).andand.destroy }
+    [*ids].each{ |id| self.find(id).andand.destroy }
   end
   
   def is_dependent_destroy?( association )
     association[:args].andand[:dependent] == :destroy
   end
   
-  def destroy_association( association )
+  def destroy_associated_models( association )
     children = self.send(association[:name])
 
     if(children.is_a? Array)
@@ -223,14 +358,14 @@ class RedisModel
     else
       children.destroy
     end
-    
-    REDIS.del self.set_redis_key(association[:name])
   end
   
   def destroy_dependents
     return if self.class.associations.nil?
     self.class.associations.each do |association|
-      destroy_association(association) if is_dependent_destroy?(association)
+      destroy_associated_models(association) if is_dependent_destroy?(association)
+      
+	  REDIS.del self.set_redis_key(association[:name])
     end
   end
   
@@ -239,8 +374,8 @@ class RedisModel
   end
   
   def self.all
-    id_list = REDIS.smembers class_set_redis_key
-    id_list.map{|id| self.find(id)}
+    # self.all_ids.map{|id| self.find(id)}
+    self.find_all_ids( self.all_ids )
   end
   
   def self.rand(args=nil)
@@ -295,26 +430,27 @@ class RedisModel
       return
     end
     
-    # def garments
+    # def items
     define_method list_name do
       klass = self.klass_for_association( list_name, args )
       key = set_redis_key(list_name)
-      REDIS.smembers( key ).map{ |item_id| klass.find(item_id) }
+      # REDIS.smembers( key ).map{ |item_id| klass.find(item_id) }
+      klass.find_all_ids( REDIS.smembers(key) )
     end
     
-    # def add_garment
+    # def add_item
     define_method "add_#{list_name.to_s.singularize}" do |new_item|
       key = set_redis_key(list_name)
       REDIS.sadd( key, new_item.id )
     end
     
-    # def remove_garment
+    # def remove_item
     define_method "remove_#{list_name.to_s.singularize}" do |item|
       key = set_redis_key(list_name)
       REDIS.srem( key, item.id )
     end
     
-    # def garment_ids
+    # def item_ids
     define_method "#{list_name.to_s.singularize}_ids" do
       REDIS.smembers( set_redis_key(list_name) )
     end
@@ -324,7 +460,14 @@ class RedisModel
   def self.belongs_to(parent_name, args={})
     register_association( parent_name, args )
     
-    define_method parent_name do
+    self.class_eval "
+      def #{parent_name}
+        @#{parent_name} ||= calculate_#{parent_name}
+        return @#{parent_name}
+      end
+    "
+    
+    define_method "calculate_#{parent_name}" do
       value = self.send "#{parent_name}_id"
       klass = self.klass_for_association( parent_name, args )
       begin
@@ -372,7 +515,7 @@ class RedisModel
   
   def temporarily_forcesend( property_name )
     @temporary_forcesendables ||= []
-    @temporary_forcesendables.push property_name
+    @temporary_forcesendables.push property_name unless @temporary_forcesendables.include?(property_name)
   end
   
   def json_sendable_value( value )
@@ -382,7 +525,29 @@ class RedisModel
     return value
   end
   
-  def to_json(options={})
+  def self.all_ids
+    REDIS.smembers(self.class_set_redis_key).map{|x| x.to_i}.sort
+  end
+  
+  def self.first
+    min_id = self.first_id
+    min_id ? self.find(min_id) : nil
+  end
+  
+  def self.first_id
+    self.all_ids.first
+  end
+  
+  def self.last
+    max_id = self.last_id
+    max_id ? self.find(max_id) : nil
+  end
+  
+  def self.last_id
+    self.all_ids.last
+  end
+  
+  def to_json(ignore_me={})
     hsh = {}
     associations = self.class.associations.andand.collect{|association| association[:name] } || []
     json_attribute_names = self.class.json_attribute_names + (@temporary_forcesendables || [])
@@ -426,6 +591,18 @@ class RedisModel
     @callbacks[:after_create] ||= []
     @callbacks[:after_create].push method_name
   end
+
+  def self.before_destroy( method_name )
+    @callbacks ||= {}
+    @callbacks[:before_destroy] ||= []
+    @callbacks[:before_destroy].push method_name
+  end
+  
+  def self.after_destroy( method_name )
+    @callbacks ||= {}
+    @callbacks[:after_destroy] ||= []
+    @callbacks[:after_destroy].push method_name
+  end
   
   # Validators
   def self.validates_presence_of( attribute_name )
@@ -459,54 +636,83 @@ class RedisModel
   def self.yaml_file_path
     "db/#{name.tableize.downcase}.yml"
   end
+
+  def self.csv_file_path
+    "db/#{name.tableize.downcase}.csv"
+  end
+  
+  
+  def yaml_attributes
+    attributes.merge({:id => self.id})
+  end
   
   # Writes content of this table to db/table_name.yml, or the specified file.
-  def self.dump_to_file( path = nil, force = false )
+  def self.dump_to_yml( path = nil, force = false )
     path ||= yaml_file_path
     if !File.exist?(path) || force
-      write_file(File.expand_path( path , RAILS_ROOT), self.all.to_yaml)
+      write_file(File.expand_path( path , RAILS_ROOT), self.all.map(&:yaml_attributes).to_yaml)
     else
-      # show_diff( path )
-      # puts "Are you sure? [y/N]"
-      # input = gets
-      # if ( input == 'y' )
-        write_file(File.expand_path( path , RAILS_ROOT), self.all.to_yaml)
-      # end
+        write_file(File.expand_path( path , RAILS_ROOT), self.all.map(&:yaml_attributes).to_yaml)
     end
   end
   
+  def self.dump_to_csv( path = nil )
+    path ||= csv_file_path
+    write_file(File.expand_path( path, RAILS_ROOT), self.all_to_csv)
+  end
+  
+  #  TODO: use FasterCSV for this (dump/load) and make sure to include the ID
+  def self.all_to_csv
+    all_records = self.all
+    headers = all_records[0].attributes.keys.reject{|k| k == :id}
+    csv = headers.join(',').to_s
+    all_records.each do |record|
+      csv << "\n"
+      values = []
+      headers.each do |v|
+        values << record.send(v)
+      end
+      csv << values.join(',')
+    end
+    return csv
+  end
+  
+  # def self.load_from_csv( path = nil )
+  #   path ||= csv_file_path
+  # end
+  
   def self.update_from_records(records)
-    all_ids = self.all.collect{ |model| model.id.to_i }
+    all_ids = self.all_ids
     new_ids = []
-    
+    max_id = 1
+        
     records.each do |record|   
       begin
         puts "record = #{record.inspect}"
-        existing_model = self.find( record.id )
-        existing_model = record 
-        existing_model.save
-      
-        all_ids.delete( record.id.to_i )
+        existing_model = self.find( record[:id] )
+        existing_model.update_attributes( record )      
+        all_ids.delete( record[:id].to_i )
       rescue RedisModel::RecordNotFound
-        new_model = self.new
-        new_model = record
-        new_ids.push( record.id )
-        new_model.save
+        puts "record not found!"
+        
+        new_model = self.create(record)
+        new_ids.push( record[:id] )
 
-        if self.name == 'StorePossession'
-          new_model.store.add_store_possession(new_model)
-        end
+        max_id = [ max_id, record[:id].to_i ].max
+        
       end
     end
     
     self.destroy( all_ids )
+    new_ids.each{|id| REDIS.sadd self.class_set_redis_key, id}
     
-    new_ids.each{ |new_id| REDIS.sadd(class_set_redis_key, new_id) }
+    #Set the id dispatcher to the maximum we found
+    REDIS.set self.class.name, max_id
     
     {:deleted=>all_ids, :created=>new_ids}
   end
   
-  def self.update_from_file( path=nil )    
+  def self.update_from_yml( path=nil )    
     path = yaml_file_path if path.nil?
     records = YAML::load( File.open( File.expand_path(path, RAILS_ROOT) ) )
     update_from_records(records)
@@ -517,4 +723,57 @@ class RedisModel
     @associations ||= []
     @associations.push({:name => association_name, :args => args}) unless associations.include? association_name
   end
+  
+  
+  
+  
+  ###################
+  # Migration Stuff #
+  ###################
+  
+  def self.migrate_set(old_key, new_key)
+    if REDIS.exists old_key
+      set = REDIS.smembers old_key
+      set.each{ |elem| REDIS.sadd new_key, elem }
+      REDIS.del old_key
+    end
+    new_key
+  end
+  
+  def self.migrate_set_with_expiry(old_key, new_key)
+    if REDIS.exists old_key
+      ttl = REDIS.ttl old_key
+      self.migrate_set(old_key, new_key)
+      REDIS.expireat new_key, (Time.now.to_i + ttl.to_i)
+    end
+    new_key
+  end
+  
+  def self.migrate_hash(old_key, new_key)
+    if REDIS.exists old_key
+      hash = REDIS.hgetall old_key
+      REDIS.hmset new_key, *hash.to_a.flatten
+      REDIS.del old_key
+    end
+    new_key
+  end
+  
+  def self.migrate_hash_with_expiry(old_key, new_key)
+    if REDIS.exists old_key
+      ttl = REDIS.ttl old_key
+      self.migrate_hash(old_key, new_key)
+      REDIS.expireat new_key, (Time.now.to_i + ttl.to_i)
+    end
+    new_key
+  end
+  
+  def self.migrate_string(old_key, new_key)
+    if REDIS.exists old_key
+      string = REDIS.get old_key
+      REDIS.set new_key, string
+      REDIS.del old_key
+    end
+    new_key
+  end
+  
 end
